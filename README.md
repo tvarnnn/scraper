@@ -23,12 +23,15 @@ playwright install chromium
 
 ```
 output/
-  content/                  ← markdown files (point your RAG at this folder)
-    page-title.md
-  metadata/                 ← JSON files (tags, links, timestamps)
-    page-title.json
-  .crawl_state.json         ← checkpoint for resuming interrupted crawls
+  ibm-docs-watsonx-waz-3-2-0-overview-watsonx-assistant-z-20260621-153012/
+    md/                     ← markdown files (point your RAG at this folder)
+      page-title.md
+    jsons/                  ← JSON files (tags, links, timestamps)
+      page-title.json
+    .crawl_state.json       ← checkpoint for resuming interrupted crawls
 ```
+
+Each scrape creates a fresh run folder under `output/`. The folder name is based on the seed URL plus a timestamp, so separate runs do not overwrite each other.
 
 ### Metadata Format
 
@@ -62,7 +65,7 @@ Each `.json` file contains:
 }
 ```
 
-Markdown files also include frontmatter with `title`, `url`, `tags`, and `keywords` before the cleaned page body. This helps simple RAG pipelines that only index the `content/` folder and ignore separate metadata files.
+Markdown files also include frontmatter with `title`, `url`, `tags`, and `keywords` before the cleaned page body. This helps simple RAG pipelines that only index the `md/` folder and ignore separate metadata files.
 
 Tags are broad auto-generated filters from the page URL and content. Possible values:
 
@@ -88,8 +91,8 @@ python scraper.py [options]
 
 | Flag | Default | Description |
 |---|---|---|
-| `--seed URL` | IBM Software Hub 5.3 | Starting page. Pass multiple times for multiple seeds |
-| `--output-dir` | `output/` | Where to save files |
+| `--seed URL` | required | Starting page. Pass multiple times for multiple seeds |
+| `--output-dir` | `output/` | Base folder for new run folders |
 | `--delay` | `1.0` | Seconds between requests. Increase if IBM rate-limits you |
 | `--limit` | none | Stop after N pages. Use for test runs |
 | `--resume` | off | Resume an interrupted crawl from checkpoint |
@@ -106,13 +109,13 @@ python scraper.py --seed "https://www.ibm.com/docs/en/watsonx/waz/3.2.0?topic=ov
 python scraper.py --seed "https://www.ibm.com/docs/en/watsonx/waz/3.2.0?topic=overview-watsonx-assistant-z"
 
 # 3. Resume if interrupted
-python scraper.py --seed "..." --resume
+python scraper.py --seed "..." --output-dir "output/YOUR-RUN-FOLDER" --resume
 
 # 4. Multiple seed pages
 python scraper.py --seed "https://ibm.com/docs/en/PAGE-1" --seed "https://ibm.com/docs/en/PAGE-2"
 
-# 5. Rewrite internal links to local files
-python scraper.py --rewrite-links
+# 5. Rewrite internal links to local files for a specific run
+python scraper.py --output-dir "output/YOUR-RUN-FOLDER" --rewrite-links
 ```
 
 > Always quote URLs — zsh treats `?` as a glob character.

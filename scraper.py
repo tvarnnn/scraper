@@ -3,6 +3,7 @@ import time
 import re
 import argparse
 import threading
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -13,7 +14,6 @@ from markdownify import markdownify
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 
-DEFAULT_SEEDS = ["https://www.ibm.com/docs/en/software-hub/5.3"]
 CHECKPOINT_FILE = ".crawl_state.json"
 MAX_KEYWORDS = 30
 
@@ -90,6 +90,28 @@ def slugify(text):
     text = re.sub(r"[^\w\s-]", "", text)
     text = re.sub(r"[\s_-]+", "-", text)
     return text[:100] or "untitled"
+
+
+def run_folder_name(seed_url):
+    parsed = urlparse(seed_url)
+    parts = [parsed.netloc.replace("www.", "").replace(".", "-")]
+    parts.extend(part.replace(".", "-") for part in parsed.path.split("/") if part)
+
+    query = parsed.query
+    topic_match = re.search(r"(?:^|&)topic=([^&]+)", query)
+    if topic_match:
+        parts.append(topic_match.group(1))
+
+    base = slugify("-".join(parts))
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{base}-{timestamp}"
+
+
+def resolve_output_dir(args):
+    base_output_dir = Path(args.output_dir)
+    if args.resume or args.rewrite_links:
+        return base_output_dir
+    return base_output_dir / run_folder_name(args.seed[0])
 
 
 def resolve_url(base, href):
@@ -374,23 +396,46 @@ def auto_tag(url, title, markdown):
 
 # ── Save ───────────────────────────────────────────────────────────────────────
 
+def content_hash(markdown):
+    normalized = re.sub(r"\s+", " ", markdown).strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def find_existing_page(json_dir, md_dir, url, page_hash):
+    for json_path in json_dir.glob("*.json"):
+        try:
+            data = json.loads(json_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+
+        if data.get("url") == url or data.get("content_hash") == page_hash:
+            return md_dir / f"{json_path.stem}.md"
+
+    return None
+
+
 def save_page(url, title, markdown, links, content_links, output_dir, roots):
-    content_dir = output_dir / "content"
-    metadata_dir = output_dir / "metadata"
-    content_dir.mkdir(parents=True, exist_ok=True)
-    metadata_dir.mkdir(parents=True, exist_ok=True)
+    md_dir = output_dir / "md"
+    json_dir = output_dir / "jsons"
+    md_dir.mkdir(parents=True, exist_ok=True)
+    json_dir.mkdir(parents=True, exist_ok=True)
+
+    page_hash = content_hash(markdown)
+    existing_path = find_existing_page(json_dir, md_dir, url, page_hash)
+    if existing_path:
+        return existing_path, False
 
     slug = slugify(title) if title else slugify(urlparse(url).path.replace("/", "-"))
-    md_path = content_dir / f"{slug}.md"
-    json_path = metadata_dir / f"{slug}.json"
+    md_path = md_dir / f"{slug}.md"
+    json_path = json_dir / f"{slug}.json"
 
     counter = 1
     while md_path.exists():
         existing = json_path.read_text(encoding="utf-8") if json_path.exists() else "{}"
         if json.loads(existing).get("url") == url:
             break
-        md_path = content_dir / f"{slug}-{counter}.md"
-        json_path = metadata_dir / f"{slug}-{counter}.json"
+        md_path = md_dir / f"{slug}-{counter}.md"
+        json_path = json_dir / f"{slug}-{counter}.json"
         counter += 1
 
     tags = auto_tag(url, title, markdown)
@@ -407,13 +452,14 @@ def save_page(url, title, markdown, links, content_links, output_dir, roots):
             "source": urlparse(roots[0]).netloc,
             "links_to": sorted(links),
             "content_links": sorted(content_links),
+            "content_hash": page_hash,
             "tags": tags,
             "keywords": keywords,
             "search_text": " ".join([title, *tags, *keywords]).strip(),
         }, indent=2),
         encoding="utf-8",
     )
-    return md_path
+    return md_path, True
 
 
 # ── Checkpoint ─────────────────────────────────────────────────────────────────
@@ -436,8 +482,8 @@ def save_checkpoint(path, visited, queue):
 # ── Link rewriting ─────────────────────────────────────────────────────────────
 
 def rewrite_links(output_dir):
-    metadata_dir = output_dir / "metadata"
-    content_dir = output_dir / "content"
+    metadata_dir = output_dir / "jsons"
+    content_dir = output_dir / "md"
     url_to_slug = {}
     for jf in metadata_dir.glob("*.json"):
         data = json.loads(jf.read_text(encoding="utf-8"))
@@ -460,7 +506,7 @@ def rewrite_links(output_dir):
 
 def crawl(args):
     roots = args.seed
-    output_dir = Path(args.output_dir)
+    output_dir = resolve_output_dir(args)
     checkpoint_path = output_dir / args.checkpoint
 
     visited, queued = load_checkpoint(checkpoint_path) if args.resume else (set(), [])
@@ -501,8 +547,11 @@ def crawl(args):
                 for link in new_links:
                     queue.put(link)
 
-                path = save_page(url, title, markdown, new_links, content_links, output_dir, roots)
-                print(f"      → {path}")
+                path, saved = save_page(url, title, markdown, new_links, content_links, output_dir, roots)
+                if saved:
+                    print(f"      → {path}")
+                else:
+                    print(f"      duplicate — already saved as {path}")
 
                 save_checkpoint(checkpoint_path, visited, list(queue.queue))
 
@@ -531,9 +580,9 @@ def main():
     parser = argparse.ArgumentParser(description="IBM Docs scraper")
 
     parser.add_argument("--seed", metavar="URL", action="append", default=None,
-        help=f"Seed URL (can pass multiple times). Default: {DEFAULT_SEEDS[0]}")
+        help="Seed URL to crawl. Can pass multiple times for multiple seeds.")
     parser.add_argument("--output-dir", "-o", default="output",
-        help="Output directory (default: output/)")
+        help="Base output directory for new run folders (default: output/)")
     parser.add_argument("--delay", "-d", type=float, default=1.0,
         help="Seconds between requests (default: 1.0)")
     parser.add_argument("--limit", "-l", type=int, default=None,
@@ -547,12 +596,12 @@ def main():
 
     args = parser.parse_args()
 
-    if args.seed is None:
-        args.seed = DEFAULT_SEEDS
-
     if args.rewrite_links:
         rewrite_links(Path(args.output_dir))
         return
+
+    if args.seed is None:
+        parser.error("--seed is required unless you are using --rewrite-links")
 
     crawl(args)
 
